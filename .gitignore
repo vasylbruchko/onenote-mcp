@@ -17,6 +17,8 @@ yarn-error.log*
 .access-token.txt
 .notebook-cache.json
 .auth-record.json
+.msal-cache-*.json
+.msal-cache-*.json.lockfile
 
 # OS files
 .DS_Store

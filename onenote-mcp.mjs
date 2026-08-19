@@ -8,7 +8,8 @@ import {
   serializeAuthenticationRecord,
   deserializeAuthenticationRecord
 } from '@azure/identity';
-import { cachePersistencePlugin } from '@azure/identity-cache-persistence';
+import { FilePersistence, PersistenceCachePlugin } from '@azure/msal-node-extensions';
+import { LogLevel } from '@azure/msal-common/node';
 import { JSDOM } from 'jsdom';
 import fs from 'fs';
 import path from 'path';
@@ -27,9 +28,28 @@ const clientId = process.env.AZURE_CLIENT_ID || '14d82eec-204b-4c2f-b7e8-296a70d
 const scopes = ['Notes.Read', 'Notes.ReadWrite', 'Notes.Read.All', 'Notes.ReadWrite.All', 'Notes.Create', 'User.Read'];
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-// Register the persistent token cache plugin (backed by macOS Keychain) once,
-// before any credential is constructed, so refresh tokens survive process restarts.
-useIdentityPlugin(cachePersistencePlugin);
+// --- File-backed MSAL token cache persistence ------------------------------
+// The keyring-based plugin (@azure/identity-cache-persistence) needs a DBus/
+// libsecret session on Linux (or macOS Keychain), which the headless gateway
+// lacks; a failed keyring init crashed this server ~2s after the first tool
+// call. Instead we register a persistence factory that writes the full MSAL
+// cache — including refresh tokens — to a JSON file next to this script. That
+// lets trySilentToken() renew access tokens across process/gateway restarts
+// without any keyring. FilePersistence chmods the cache file to 0600.
+const msalCacheFilePlugin = (context) => {
+  context.cachePluginControl.setPersistence(async (options) => {
+    const name = options?.name || 'onenote-mcp-token-cache';
+    const cacheFile = path.join(__dirname, `.msal-cache-${name}.json`);
+    const persistence = await FilePersistence.create(cacheFile, {
+      loggerCallback: () => {},
+      logLevel: LogLevel.Error
+    });
+    return new PersistenceCachePlugin(persistence, { retryNumber: 100, retryDelay: 50 });
+  });
+};
+// Register once, before any credential is constructed, so refresh tokens
+// survive process restarts.
+useIdentityPlugin(msalCacheFilePlugin);
 
 // --- Global State ---
 let accessToken = null;
@@ -144,7 +164,8 @@ function persistAccessTokenFile(tokenResponse) {
 /**
  * Gets (or lazily creates) the single shared DeviceCodeCredential instance.
  * Cache persistence is enabled so refresh tokens survive process restarts
- * (stored in the macOS Keychain). disableAutomaticAuthentication is set so
+ * (stored in a file via the file-backed cache plugin registered above).
+ * disableAutomaticAuthentication is set so
  * that silent getToken() calls fail fast instead of unexpectedly prompting
  * mid-tool-call — interactive prompting only happens via the explicit
  * 'authenticate' tool, which calls credential.authenticate() directly.
@@ -156,6 +177,10 @@ function getSharedCredential() {
     sharedCredential = new DeviceCodeCredential({
       clientId,
       tokenCachePersistenceOptions: {
+        // Enabled with the file-backed cache plugin (registered above): the
+        // MSAL cache — including refresh tokens — is persisted to
+        // .msal-cache-*.json next to this script, so silent renewal survives
+        // process/gateway restarts on the headless gateway (no keyring).
         enabled: true,
         name: 'onenote-mcp-token-cache'
       },
@@ -2550,6 +2575,15 @@ async function main() {
     process.on('SIGTERM', () => {
       console.error('\n🔌 OneNote MCP Server terminated...');
       process.exit(0);
+    });
+
+    // Keep the stdio MCP server alive across async library errors
+    // (e.g. token-cache init failures) instead of silently dying.
+    process.on('unhandledRejection', (reason) => {
+      console.error('⚠️ Unhandled rejection (server kept alive):', reason instanceof Error ? reason.message : reason);
+    });
+    process.on('uncaughtException', (err) => {
+      console.error('⚠️ Uncaught exception (server kept alive):', err.message);
     });
 
   } catch (error) {

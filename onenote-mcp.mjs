@@ -36,20 +36,77 @@ const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 // cache — including refresh tokens — to a JSON file next to this script. That
 // lets trySilentToken() renew access tokens across process/gateway restarts
 // without any keyring. FilePersistence chmods the cache file to 0600.
+// --- Hardened MSAL cache persistence (2026-08-19) --------------------------
+// FilePersistence.save() in @azure/msal-node-extensions uses a plain
+// promises.writeFile() — a torn write (process kill, disk hiccup, or a second
+// process hitting the same file) leaves a corrupted cache (observed twice on
+// 2026-08-19: a ~1500-char binary blob where the JWT should be) that bricks
+// silent renewal until a device-code re-auth. So we:
+//   1. write the cache atomically (tmp + rename) so a crash can't tear it;
+//   2. keep a validated last-good snapshot (<cacheFile>.lastgood);
+//   3. auto-restore from that snapshot when the cache fails validation
+//      (process startup + before the first silent renewal), so a corrupt
+//      file self-heals instead of forcing a re-auth.
+function msalValidateCacheFile(file) {
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return data !== null && typeof data === 'object';
+  } catch {
+    return false;
+  }
+}
+async function msalAtomicWrite(file, contents) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  await fs.promises.writeFile(tmp, contents, { encoding: 'utf-8', mode: 0o600 });
+  await fs.promises.rename(tmp, file);
+}
+function msalEnsureCacheHealthy(cacheFile) {
+  if (msalValidateCacheFile(cacheFile)) return;
+  const lastGood = `${cacheFile}.lastgood`;
+  if (!fs.existsSync(lastGood) || !msalValidateCacheFile(lastGood)) {
+    console.error(`MSAL cache ${cacheFile} is corrupt and no valid .lastgood snapshot exists — device-code re-auth required.`);
+    return;
+  }
+  fs.copyFileSync(lastGood, cacheFile);
+  fs.chmodSync(cacheFile, 0o600);
+  console.error(`MSAL cache ${cacheFile} was corrupt — restored validated snapshot from ${lastGood}.`);
+}
 const msalCacheFilePlugin = (context) => {
   context.cachePluginControl.setPersistence(async (options) => {
     const name = options?.name || 'onenote-mcp-token-cache';
     const cacheFile = path.join(__dirname, `.msal-cache-${name}.json`);
+    const lastGood = `${cacheFile}.lastgood`;
     const persistence = await FilePersistence.create(cacheFile, {
       loggerCallback: () => {},
       logLevel: LogLevel.Error
     });
+    // Hardened save: atomic write + validated last-good snapshot.
+    persistence.save = async (contents) => {
+      await msalAtomicWrite(cacheFile, contents);
+      await fs.promises.chmod(cacheFile, 0o600);
+      try {
+        if (msalValidateCacheFile(cacheFile)) {
+          await msalAtomicWrite(lastGood, fs.readFileSync(cacheFile, 'utf8'));
+          await fs.promises.chmod(lastGood, 0o600);
+        }
+      } catch (err) {
+        console.error(`MSAL cache last-good snapshot failed: ${err.message}`);
+      }
+    };
+    msalEnsureCacheHealthy(cacheFile);
     return new PersistenceCachePlugin(persistence, { retryNumber: 100, retryDelay: 50 });
   });
 };
 // Register once, before any credential is constructed, so refresh tokens
 // survive process restarts.
 useIdentityPlugin(msalCacheFilePlugin);
+// Startup health check: self-heal a corrupt cache now (before the first
+// silent renewal in this process), not only lazily on credential creation.
+try {
+  msalEnsureCacheHealthy(path.join(__dirname, '.msal-cache-onenote-mcp-token-cache.json'));
+} catch (e) {
+  console.error(`MSAL cache startup health check failed: ${e.message}`);
+}
 
 // --- Global State ---
 let accessToken = null;

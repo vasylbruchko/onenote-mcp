@@ -2379,7 +2379,7 @@ server.tool(
 // .pending-notebook.json, and runs the merge script — so LLM-derived
 // summaries are what land in index.json and INDEX.md.
 
-const INDEX_ROOT = process.env.ONENOTE_INDEX_DIR || '/home/mintvm/.openclaw/workspace/onenote';
+const INDEX_ROOT = process.env.ONENOTE_INDEX_DIR || '/home/mintvm/.hermes/onenote';
 const INDEX_PAGES_PER_SECTION = 25;   // index keeps the most recent 25 pages per section
 const INDEX_LISTING_TOP = 100;        // OneNote page listings are capped at 100 per call
 

@@ -42,3 +42,9 @@ tests/fixtures/.test-access-token.txt
 
 # MSAL cache last-good snapshot (token material — never commit)
 .msal-cache-*.json.lastgood
+
+# Local OneNote index (personal notebook content — never commit)
+INDEX.md
+index.json
+.refresh-checkpoint.json
+.pending-notebook.json

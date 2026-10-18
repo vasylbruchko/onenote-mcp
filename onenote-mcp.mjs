@@ -17,6 +17,7 @@ import { fileURLToPath } from 'url';
 import fetch from 'node-fetch';
 import { spawn } from 'node:child_process';
 import { z } from "zod";
+import { getTokenExpiry, isTokenStale, TOKEN_REFRESH_BUFFER_MS } from './lib/tokenExpiry.mjs';
 
 // --- Configuration ---
 const __filename = fileURLToPath(import.meta.url);
@@ -111,9 +112,8 @@ try {
 
 // --- Global State ---
 let accessToken = null;
-let accessTokenExpiresOn = null;
-// Renew before the final minutes so a token cannot expire during a Graph call.
-const ACCESS_TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
+let accessTokenExpiresAt = null; // Epoch ms for the current accessToken, or null if unknown
+
 let graphClient = null;
 let notebookCache = null; // Cache of notebooks with group info
 let cacheTimestamp = null; // When cache was last updated
@@ -135,47 +135,75 @@ const server = new McpServer({
 // ============================================================================
 
 /**
- * Returns true only when the in-memory token is not close to expiration.
- * Tokens without expiry metadata are accepted for backward compatibility.
+ * Whether the in-memory access token is present and not within the refresh
+ * buffer of expiring. A token whose expiry cannot be determined is treated as
+ * usable, so opaque (non-JWT) tokens keep working.
+ * @returns {boolean}
+
  */
 function hasUsableAccessToken() {
   if (!accessToken) return false;
-  if (!Number.isFinite(accessTokenExpiresOn)) return true;
-  return accessTokenExpiresOn > Date.now() + ACCESS_TOKEN_REFRESH_SKEW_MS;
+  return !isTokenStale(accessTokenExpiresAt);
 }
 
 /**
- * Loads an existing, unexpired access token from the local file system.
- * @returns {boolean} true when a usable token was loaded
+ * Loads an existing access token from the local file system.
+ * An expired token (or one within TOKEN_REFRESH_BUFFER_MS of expiring) is
+ * rejected, leaving accessToken null so callers fall through to silent
+ * renewal from the Keychain-backed cache instead of installing a dead token
+ * into the Graph client and 401ing on every request.
+ * @param {object} [options]
+ * @param {boolean} [options.allowExpired=false] - Load the token even when
+ *   expired; used by diagnostic tools that inspect a stale token.
+ * @returns {boolean} True if a token was loaded into memory.
  */
-function loadExistingToken() {
+function loadExistingToken({ allowExpired = false } = {}) {
   try {
-    if (fs.existsSync(tokenFilePath)) {
-      const tokenData = fs.readFileSync(tokenFilePath, 'utf8');
-      try {
-        const parsedToken = JSON.parse(tokenData); // New format: JSON object
-        accessToken = parsedToken.token;
-        accessTokenExpiresOn = parsedToken.expiresOn ? Date.parse(parsedToken.expiresOn) : null;
-        if (parsedToken.expiresOn && !Number.isFinite(accessTokenExpiresOn)) {
-          accessTokenExpiresOn = 0;
-        }
-        if (!hasUsableAccessToken()) {
-          accessToken = null;
-          accessTokenExpiresOn = null;
-          graphClient = null;
-          console.error('Stored access token is expired or near expiry; silent renewal required.');
-          return false;
-        }
-        console.error('Loaded existing token from file (JSON format).');
-      } catch (parseError) {
-        accessToken = tokenData; // Old format: plain token string
-        accessTokenExpiresOn = null;
-        console.error('Loaded existing token from file (plain text format).');
-      }
-      return Boolean(accessToken);
+    if (!fs.existsSync(tokenFilePath)) return false;
+    const tokenData = fs.readFileSync(tokenFilePath, 'utf8');
+
+    let token;
+    let metadataExpiresOn = null;
+    let format;
+    try {
+      const parsedToken = JSON.parse(tokenData); // New format: JSON object
+      token = parsedToken.token;
+      metadataExpiresOn = parsedToken.expiresOn || null;
+      format = 'JSON';
+    } catch (parseError) {
+      token = tokenData.trim(); // Old format: plain token string
+      format = 'plain text';
+
     }
+
+    if (!token) {
+      console.error('Token file present but contained no token.');
+      return false;
+    }
+
+    const expiresAt = getTokenExpiry(token, metadataExpiresOn);
+    const stale = isTokenStale(expiresAt);
+
+    if (stale && !allowExpired) {
+      const minutesAgo = Math.round((Date.now() - expiresAt) / 60000);
+      console.error(minutesAgo >= 0
+        ? `Ignoring token from file — expired ${minutesAgo} min ago; will renew silently from the persisted cache.`
+        : `Ignoring token from file — expires within the ${Math.round(TOKEN_REFRESH_BUFFER_MS / 60000)} min refresh buffer; will renew silently from the persisted cache.`);
+      return false;
+    }
+
+    accessToken = token;
+    accessTokenExpiresAt = expiresAt;
+    const validity = expiresAt === null
+      ? 'expiry unknown'
+      : stale
+        ? 'EXPIRED'
+        : `valid for ${Math.round((expiresAt - Date.now()) / 60000)} min`;
+    console.error(`Loaded existing token from file (${format} format, ${validity}).`);
+    return true;
   } catch (error) {
     console.error(`Error loading token: ${error.message}`);
+    return false;
   }
   return false;
 }
@@ -234,14 +262,12 @@ function saveAuthenticationRecord(record) {
  */
 function persistAccessTokenFile(tokenResponse) {
   try {
-    accessTokenExpiresOn = tokenResponse?.expiresOnTimestamp ?? null;
-    const expiresOn = accessTokenExpiresOn ? new Date(accessTokenExpiresOn).toISOString() : null;
     const tokenData = {
       token: accessToken,
       clientId,
       scopes,
       createdAt: new Date().toISOString(),
-      expiresOn
+      expiresOn: tokenResponse?.expiresOnTimestamp ? new Date(tokenResponse.expiresOnTimestamp).toISOString() : null
     };
     fs.writeFileSync(tokenFilePath, JSON.stringify(tokenData, null, 2));
   } catch (error) {
@@ -294,10 +320,8 @@ async function trySilentToken() {
     const tokenResponse = await credential.getToken(scopes);
     if (tokenResponse?.token) {
       accessToken = tokenResponse.token;
-      accessTokenExpiresOn = tokenResponse.expiresOnTimestamp ?? null;
-      // Force reconstruction after renewal. The auth provider reads the global
-      // token, but rebuilding also prevents other client state from going stale.
-      graphClient = null;
+      accessTokenExpiresAt = tokenResponse.expiresOnTimestamp ?? getTokenExpiry(tokenResponse.token);
+
       persistAccessTokenFile(tokenResponse);
       console.error('Renewed access token silently from persisted cache.');
       return true;
@@ -317,11 +341,11 @@ async function trySilentToken() {
  */
 async function ensureGraphClient() {
   if (!hasUsableAccessToken()) {
-    accessToken = null;
-    accessTokenExpiresOn = null;
-    graphClient = null;
+
     const gotSilentToken = await trySilentToken();
-    if (!gotSilentToken) {
+    // Only fall back to the flat token file when we have nothing at all; a
+    // token already in memory is at least as fresh as whatever is on disk.
+    if (!gotSilentToken && !accessToken) {
       loadExistingToken();
     }
   }
@@ -1199,8 +1223,8 @@ server.tool(
           saveAuthenticationRecord(authRecord);
           const tokenResponse = await credential.getToken(scopes);
           accessToken = tokenResponse.token;
-          accessTokenExpiresOn = tokenResponse.expiresOnTimestamp ?? null;
-          graphClient = null;
+          accessTokenExpiresAt = tokenResponse.expiresOnTimestamp ?? getTokenExpiry(tokenResponse.token);
+
           persistAccessTokenFile(tokenResponse);
           console.error('Token acquired and cached — future sessions should renew automatically.');
           initializeGraphClient();
@@ -1271,7 +1295,7 @@ server.tool(
     try {
       if (!hasUsableAccessToken()) {
         accessToken = null;
-        accessTokenExpiresOn = null;
+        accessTokenExpiresAt = null;
         graphClient = null;
         await trySilentToken();
       }
@@ -1308,7 +1332,8 @@ server.tool(
   },
   async () => {
     try {
-      loadExistingToken();
+      // Diagnostic tool: inspect whatever token exists, even an expired one.
+      loadExistingToken({ allowExpired: true });
       if (!accessToken) {
         return { isError: true, content: [{ type: 'text', text: `❌ **No Token Found.** Please run the 'authenticate' tool first.` }] };
       }
@@ -3099,17 +3124,19 @@ server.tool(
  * Main function to initialize and start the MCP server.
  */
 async function main() {
-  loadExistingToken(); // Attempt to load token at startup
-  if (accessToken) {
+  if (loadExistingToken()) { // Attempt to load token at startup
     initializeGraphClient(); // Initialize client if token was loaded
-    
-    // Load notebook cache from disk if available
-    const cacheLoaded = loadNotebookCacheFromDisk();
-    if (cacheLoaded) {
-      console.error('📦 Notebook cache loaded from disk');
-    } else {
-      console.error('💾 No valid cache found, will load on first use');
-    }
+  } else {
+    console.error('No usable token on disk — will renew silently from the persisted cache on first use.');
+  }
+
+  // The notebook cache is independent of auth state, so load it either way:
+  // a silent renewal on the first tool call shouldn't also pay for a cold cache.
+  const cacheLoaded = loadNotebookCacheFromDisk();
+  if (cacheLoaded) {
+    console.error('📦 Notebook cache loaded from disk');
+  } else {
+    console.error('💾 No valid cache found, will load on first use');
   }
 
   try {
